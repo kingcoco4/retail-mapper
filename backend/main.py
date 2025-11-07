@@ -17,6 +17,7 @@ import asyncio
 import json
 from io import StringIO
 import csv
+from datetime import datetime
 
 # Configure logging (no emojis)
 logging.basicConfig(
@@ -46,6 +47,8 @@ class Business(BaseModel):
     name: str
     address: str
     status: str
+    permit_begin: Optional[str] = None
+    permit_end: Optional[str] = None
     lat: Optional[float] = None
     lon: Optional[float] = None
 
@@ -74,9 +77,11 @@ def init_db():
             name TEXT NOT NULL,
             address TEXT,
             status TEXT,
+            permit_begin TEXT,
+            permit_end TEXT,
             lat REAL,
             lon REAL,
-            scraped_at DATETIME,
+            cached_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             geocoded_at DATETIME,
             geocode_source TEXT,
             UNIQUE(zipcode, name, address)
@@ -100,7 +105,6 @@ async def broadcast_progress(data: dict):
         except:
             disconnected.append(connection)
     
-    # Remove disconnected clients
     for conn in disconnected:
         active_connections.remove(conn)
 
@@ -113,7 +117,6 @@ async def websocket_endpoint(websocket: WebSocket):
     
     try:
         while True:
-            # Keep connection alive
             await websocket.receive_text()
     except WebSocketDisconnect:
         active_connections.remove(websocket)
@@ -129,6 +132,7 @@ def root():
         "endpoints": {
             "zipcodes": "/api/zipcodes",
             "businesses": "/api/businesses/{zipcode}",
+            "timeline": "/api/businesses/{zipcode}/timeline",
             "geocode": "/api/geocode/{zipcode}",
             "stats": "/api/stats",
             "docs": "/docs"
@@ -171,10 +175,7 @@ def get_cached_zipcodes():
 
 @app.get("/api/businesses/{zipcode}", response_model=List[Business])
 def get_businesses(zipcode: str, active_only: bool = False):
-    """
-    Get businesses for ZIP code
-    Returns cached data if available, otherwise scrapes
-    """
+    """Get businesses for ZIP code"""
     if len(zipcode) != 5 or not zipcode.isdigit():
         raise HTTPException(status_code=400, detail="Invalid ZIP code format")
     
@@ -182,9 +183,8 @@ def get_businesses(zipcode: str, active_only: bool = False):
     
     conn = sqlite3.connect(DB_PATH)
     
-    # Check if already in database
     cursor = conn.execute(
-        "SELECT name, address, status, lat, lon FROM businesses WHERE zipcode = ?",
+        "SELECT name, address, status, permit_begin, permit_end, lat, lon FROM businesses WHERE zipcode = ?",
         (zipcode,)
     )
     cached = cursor.fetchall()
@@ -192,7 +192,15 @@ def get_businesses(zipcode: str, active_only: bool = False):
     if cached:
         logger.info(f"Found {len(cached)} cached businesses for ZIP {zipcode}")
         businesses = [
-            Business(name=row[0], address=row[1], status=row[2], lat=row[3], lon=row[4])
+            Business(
+                name=row[0], 
+                address=row[1], 
+                status=row[2],
+                permit_begin=row[3],
+                permit_end=row[4],
+                lat=row[5], 
+                lon=row[6]
+            )
             for row in cached
         ]
         conn.close()
@@ -202,10 +210,8 @@ def get_businesses(zipcode: str, active_only: bool = False):
         
         return businesses
     
-    # Not cached - need to scrape
     logger.info(f"No cache found for ZIP {zipcode}, initiating scrape")
     
-    # Check scrape cache file
     scrape_cache_file = SCRAPE_CACHE_DIR / f"{zipcode}.json"
     
     if scrape_cache_file.exists():
@@ -216,29 +222,31 @@ def get_businesses(zipcode: str, active_only: bool = False):
         logger.info(f"No scrape cache file found, scraping from source")
         raw_businesses = scrape_zipcode(zipcode)
         
-        # Save to scrape cache
         with open(scrape_cache_file, 'w') as f:
             json.dump(raw_businesses, f, indent=2)
         logger.info(f"Saved {len(raw_businesses)} businesses to scrape cache")
     
-    # Store in database WITHOUT geocoding (instant response)
     businesses = []
     for biz in raw_businesses:
         cursor = conn.execute("""
             INSERT OR IGNORE INTO businesses 
-            (zipcode, name, address, status, lat, lon, scraped_at)
-            VALUES (?, ?, ?, ?, NULL, NULL, CURRENT_TIMESTAMP)
+            (zipcode, name, address, status, permit_begin, permit_end, lat, lon)
+            VALUES (?, ?, ?, ?, ?, ?, NULL, NULL)
         """, (
             zipcode,
             biz.get('name', 'Unknown'),
             biz.get('address', ''),
-            biz.get('status', 'UNKNOWN')
+            biz.get('status', 'UNKNOWN'),
+            biz.get('permit_begin'),
+            biz.get('permit_end')
         ))
         
         businesses.append(Business(
             name=biz.get('name', 'Unknown'),
             address=biz.get('address', ''),
             status=biz.get('status', 'UNKNOWN'),
+            permit_begin=biz.get('permit_begin'),
+            permit_end=biz.get('permit_end'),
             lat=None,
             lon=None
         ))
@@ -250,25 +258,138 @@ def get_businesses(zipcode: str, active_only: bool = False):
     
     return businesses
 
+@app.get("/api/businesses/{zipcode}/timeline")
+def get_businesses_timeline(zipcode: str):
+    """Get businesses with timeline data"""
+    if len(zipcode) != 5 or not zipcode.isdigit():
+        raise HTTPException(status_code=400, detail="Invalid ZIP code format")
+    
+    conn = sqlite3.connect(DB_PATH)
+    
+    cursor = conn.execute(
+        "SELECT COUNT(*) FROM businesses WHERE zipcode = ?",
+        (zipcode,)
+    )
+    count = cursor.fetchone()[0]
+    
+    if count == 0:
+        logger.info(f"No data found for ZIP {zipcode}, scraping now...")
+        raw_businesses = scrape_zipcode(zipcode)
+        
+        if not raw_businesses:
+            conn.close()
+            return {'businesses': [], 'min_date': None, 'max_date': None}
+        
+        for biz in raw_businesses:
+            conn.execute("""
+                INSERT OR IGNORE INTO businesses 
+                (zipcode, name, address, status, permit_begin, permit_end, lat, lon)
+                VALUES (?, ?, ?, ?, ?, ?, NULL, NULL)
+            """, (
+                zipcode,
+                biz.get('name', 'Unknown'),
+                biz.get('address', ''),
+                biz.get('status', 'UNKNOWN'),
+                biz.get('permit_begin'),
+                biz.get('permit_end')
+            ))
+        
+        conn.commit()
+        logger.info(f"Stored {len(raw_businesses)} businesses for ZIP {zipcode}")
+    
+    cursor = conn.execute("""
+        SELECT 
+            name,
+            address,
+            status,
+            lat,
+            lon,
+            permit_begin,
+            permit_end
+        FROM businesses
+        WHERE zipcode = ?
+        AND lat IS NOT NULL
+        ORDER BY permit_begin
+    """, (zipcode,))
+    
+    results = []
+    for row in cursor.fetchall():
+        permit_begin = row[5]
+        permit_end = row[6]
+        
+        # Parse dates - handle MM/DD/YYYY format from Texas Comptroller
+        begin_date = None
+        end_date = None
+        
+        if permit_begin:
+            try:
+                # Try MM/DD/YYYY format first (Texas Comptroller format)
+                begin_date = datetime.strptime(permit_begin, '%m/%d/%Y')
+            except ValueError:
+                try:
+                    # Fallback to YYYY-MM-DD format
+                    begin_date = datetime.strptime(permit_begin, '%Y-%m-%d')
+                except ValueError:
+                    logger.warning(f"Could not parse begin date: {permit_begin}")
+        
+        if permit_end:
+            try:
+                # Try MM/DD/YYYY format first
+                end_date = datetime.strptime(permit_end, '%m/%d/%Y')
+            except ValueError:
+                try:
+                    # Fallback to YYYY-MM-DD format
+                    end_date = datetime.strptime(permit_end, '%Y-%m-%d')
+                except ValueError:
+                    logger.warning(f"Could not parse end date: {permit_end}")
+        
+        # Use current date if no end date
+        if not end_date:
+            end_date = datetime.now()
+        
+        results.append({
+            'name': row[0],
+            'address': row[1],
+            'status': row[2],
+            'lat': row[3],
+            'lon': row[4],
+            'permit_begin': permit_begin,
+            'permit_end': permit_end,
+            'begin_timestamp': begin_date.timestamp() if begin_date else None,
+            'end_timestamp': end_date.timestamp() if end_date else datetime.now().timestamp()
+        })
+    
+    conn.close()
+    
+    if not results:
+        return {
+            'businesses': [],
+            'min_date': None,
+            'max_date': None
+        }
+    
+    all_dates = [r['begin_timestamp'] for r in results if r['begin_timestamp']]
+    
+    return {
+        'businesses': results,
+        'min_date': min(all_dates) if all_dates else None,
+        'max_date': max([r['end_timestamp'] for r in results]) if results else None
+    }
+
 @app.post("/api/geocode/{zipcode}")
 async def geocode_zipcode_endpoint(zipcode: str):
-    """
-    Trigger geocoding for a ZIP code
-    Returns immediately, geocoding happens in background with WebSocket updates
-    """
+    """Trigger geocoding for a ZIP code"""
     if len(zipcode) != 5 or not zipcode.isdigit():
         raise HTTPException(status_code=400, detail="Invalid ZIP code format")
     
     logger.info(f"Geocoding request received for ZIP {zipcode}")
     
-    # Check if already geocoded
     geocode_cache_file = GEOCODE_CACHE_DIR / f"{zipcode}.json"
     
     if geocode_cache_file.exists():
         logger.info(f"ZIP {zipcode} already geocoded (cache file exists)")
         return {"status": "already_geocoded", "zipcode": zipcode}
     
-    # Start background task
     asyncio.create_task(geocode_zipcode_background(zipcode))
     
     return {"status": "geocoding_started", "zipcode": zipcode}
@@ -292,14 +413,12 @@ async def geocode_zipcode_background(zipcode: str):
         logger.info(f"No addresses to geocode for ZIP {zipcode}")
         return
     
-    # Broadcast initial progress
     await broadcast_progress({
         "type": "geocode_start",
         "zipcode": zipcode,
         "total": total
     })
     
-    # Process in batches of 500 (Census API limit)
     batch_size = 500
     completed = 0
     success_count = 0
@@ -311,11 +430,9 @@ async def geocode_zipcode_background(zipcode: str):
         
         logger.info(f"Processing batch {batch_start//batch_size + 1}: addresses {batch_start+1}-{batch_end} of {total}")
         
-        # Prepare batch for Census geocoder
         batch_data = [{"id": row[0], "address": row[1]} for row in batch]
         results = geocode_batch_census(batch_data, zipcode)
         
-        # Update database and broadcast progress
         for result in results:
             biz_id = result['id']
             lat = result.get('lat')
@@ -335,7 +452,6 @@ async def geocode_zipcode_background(zipcode: str):
             
             completed += 1
             
-            # Broadcast progress every 10 addresses
             if completed % 10 == 0:
                 await broadcast_progress({
                     "type": "geocode_progress",
@@ -350,12 +466,10 @@ async def geocode_zipcode_background(zipcode: str):
         conn.commit()
         logger.info(f"Batch complete: {success_count} success, {failed_count} failed")
         
-        # Rate limiting (be nice to Census API)
         await asyncio.sleep(0.5)
     
     conn.close()
     
-    # Mark as complete in cache
     geocode_cache_file = GEOCODE_CACHE_DIR / f"{zipcode}.json"
     with open(geocode_cache_file, 'w') as f:
         json.dump({
@@ -368,7 +482,6 @@ async def geocode_zipcode_background(zipcode: str):
     
     logger.info(f"Geocoding complete for ZIP {zipcode}: {success_count}/{total} success")
     
-    # Final broadcast
     await broadcast_progress({
         "type": "geocode_complete",
         "zipcode": zipcode,
@@ -377,15 +490,10 @@ async def geocode_zipcode_background(zipcode: str):
         "failed": failed_count
     })
 
-
-
 def geocode_batch_census(addresses: List[dict], zipcode: str) -> List[dict]:
-    """
-    Geocode batch using US Census Geocoder
-    """
+    """Geocode batch using US Census Geocoder"""
     logger.info(f"Sending batch of {len(addresses)} addresses to Census API")
     
-    # Prepare CSV format
     csv_lines = [f"{addr['id']},{addr['address']},,,{zipcode}" for addr in addresses]
     csv_content = '\n'.join(csv_lines)
     
@@ -403,7 +511,6 @@ def geocode_batch_census(addresses: List[dict], zipcode: str) -> List[dict]:
         
         logger.info(f"Census API response received, parsing results")
         
-        # USE CSV PARSER instead of split()
         results = []
         csv_reader = csv.reader(StringIO(response.text))
         
@@ -411,25 +518,19 @@ def geocode_batch_census(addresses: List[dict], zipcode: str) -> List[dict]:
             if not row:
                 continue
             
-            # Debug first 3 rows
             if line_num < 3:
                 logger.debug(f"Parsing line {line_num}: {len(row)} columns")
-                logger.debug(f"  Row: {row[:8]}")  # First 8 columns
+                logger.debug(f"  Row: {row[:8]}")
             
-            # Census format has at least 6 columns
             if len(row) >= 6:
                 biz_id = int(row[0])
-                input_address = row[1]
                 match_status = row[2]
-                match_type = row[3] if len(row) > 3 else ''
-                matched_address = row[4] if len(row) > 4 else ''
                 coords_str = row[5] if len(row) > 5 else ''
                 
                 result = {'id': biz_id, 'lat': None, 'lon': None}
                 
                 if match_status == 'Match' and coords_str:
                     try:
-                        # Coordinates are in "lon,lat" format
                         lon, lat = coords_str.split(',')
                         result['lat'] = float(lat.strip())
                         result['lon'] = float(lon.strip())
@@ -456,10 +557,7 @@ def geocode_batch_census(addresses: List[dict], zipcode: str) -> List[dict]:
         return [{'id': addr['id'], 'lat': None, 'lon': None} for addr in addresses]
 
 def scrape_zipcode(zipcode: str) -> list:
-    """
-    Scrape businesses from Texas Comptroller website
-    Based on your original scraper [1]
-    """
+    """Scrape businesses from Texas Comptroller website"""
     logger.info(f"Starting scrape for ZIP code {zipcode}")
     
     url = "https://mycpa.cpa.state.tx.us/staxpayersearch/locationSearch.do"
@@ -492,9 +590,7 @@ def scrape_zipcode(zipcode: str) -> list:
         
         businesses = []
         
-        # Parse table rows (skip header)
         for tr in table.find_all("tr")[1:]:
-            # Remove any <a> tags
             for a in tr.find_all("a"):
                 a.decompose()
             
@@ -506,6 +602,8 @@ def scrape_zipcode(zipcode: str) -> list:
                     'status': tds[1] if len(tds) > 1 else 'UNKNOWN',
                     'address': tds[2] if len(tds) > 2 else '',
                     'city_state_zip': tds[3] if len(tds) > 3 else '',
+                    'permit_begin': tds[6] if len(tds) > 6 else None,
+                    'permit_end': tds[7] if len(tds) > 7 else None,
                 })
         
         logger.info(f"Successfully scraped {len(businesses)} businesses from ZIP {zipcode}")
@@ -536,7 +634,6 @@ def get_stats():
     cursor = conn.execute("SELECT COUNT(DISTINCT zipcode) FROM businesses")
     stats['zipcodes_cached'] = cursor.fetchone()[0]
     
-    # Count cache files
     stats['scrape_cache_files'] = len(list(SCRAPE_CACHE_DIR.glob("*.json")))
     stats['geocode_cache_files'] = len(list(GEOCODE_CACHE_DIR.glob("*.json")))
     

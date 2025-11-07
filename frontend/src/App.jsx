@@ -15,12 +15,277 @@ L.Icon.Default.mergeOptions({
 const API_URL = 'http://localhost:8000/api'
 const WS_URL = 'ws://localhost:8000/ws'
 
+// Helper functions
+function formatDate(dateString) {
+  if (!dateString) return 'N/A'
+  const date = new Date(dateString)
+  return date.toLocaleDateString('en-US', { 
+    year: 'numeric', 
+    month: 'short', 
+    day: 'numeric' 
+  })
+}
+
+function formatDateShort(dateString) {
+  if (!dateString) return 'Present'
+  const date = new Date(dateString)
+  return date.toLocaleDateString('en-US', { 
+    year: 'numeric', 
+    month: 'short'
+  })
+}
+
+function calculateDuration(startDate, endDate) {
+  if (!startDate) return 'Unknown'
+  
+  const start = new Date(startDate)
+  const end = endDate ? new Date(endDate) : new Date()
+  
+  const years = end.getFullYear() - start.getFullYear()
+  const months = end.getMonth() - start.getMonth()
+  
+  const totalMonths = years * 12 + months
+  const displayYears = Math.floor(totalMonths / 12)
+  const displayMonths = totalMonths % 12
+  
+  if (displayYears > 0 && displayMonths > 0) {
+    return `${displayYears}y ${displayMonths}m`
+  } else if (displayYears > 0) {
+    return `${displayYears} year${displayYears > 1 ? 's' : ''}`
+  } else {
+    return `${displayMonths} month${displayMonths > 1 ? 's' : ''}`
+  }
+}
+
 function MapUpdater({ center, zoom }) {
   const map = useMap()
   useEffect(() => {
     map.setView(center, zoom)
   }, [center, zoom, map])
   return null
+}
+
+// Timeline Slider Component
+function TimelineSlider({ minDate, maxDate, currentDate, onDateChange, businesses }) {
+  const [isDragging, setIsDragging] = useState(false)
+  
+  const handleSliderChange = (e) => {
+    const timestamp = parseFloat(e.target.value)
+    onDateChange(timestamp)
+  }
+  
+  const formatSliderDate = (timestamp) => {
+    if (!timestamp) return ''
+    const date = new Date(timestamp * 1000)
+    return date.toLocaleDateString('en-US', { year: 'numeric', month: 'short' })
+  }
+  
+  // Count businesses active at current date
+  const activeCount = businesses.filter(b => {
+    const begin = b.begin_timestamp
+    const end = b.end_timestamp
+    return begin && begin <= currentDate && currentDate <= end
+  }).length
+  
+  return (
+    <div style={{
+      position: 'absolute',
+      bottom: '30px',
+      left: '50%',
+      transform: 'translateX(-50%)',
+      backgroundColor: 'white',
+      padding: '15px 20px',
+      borderRadius: '8px',
+      boxShadow: '0 2px 10px rgba(0,0,0,0.3)',
+      zIndex: 1000,
+      minWidth: '400px',
+      maxWidth: '600px'
+    }}>
+      <div style={{ 
+        marginBottom: '10px', 
+        display: 'flex', 
+        justifyContent: 'space-between',
+        alignItems: 'center'
+      }}>
+        <strong style={{ fontSize: '14px' }}>Timeline Filter</strong>
+        <span style={{ 
+          fontSize: '12px', 
+          color: '#666',
+          backgroundColor: '#e3f2fd',
+          padding: '3px 8px',
+          borderRadius: '4px'
+        }}>
+          {activeCount} active business{activeCount !== 1 ? 'es' : ''}
+        </span>
+      </div>
+      
+      <div style={{ marginBottom: '8px' }}>
+        <input
+          type="range"
+          min={minDate}
+          max={maxDate}
+          value={currentDate}
+          onChange={handleSliderChange}
+          onMouseDown={() => setIsDragging(true)}
+          onMouseUp={() => setIsDragging(false)}
+          onTouchStart={() => setIsDragging(true)}
+          onTouchEnd={() => setIsDragging(false)}
+          style={{
+            width: '100%',
+            height: '6px',
+            borderRadius: '3px',
+            outline: 'none',
+            cursor: 'pointer'
+          }}
+        />
+      </div>
+      
+      <div style={{ 
+        display: 'flex', 
+        justifyContent: 'space-between',
+        fontSize: '11px',
+        color: '#666'
+      }}>
+        <span>{formatSliderDate(minDate)}</span>
+        <span style={{ fontWeight: 'bold', color: '#007bff' }}>
+          {formatSliderDate(currentDate)}
+        </span>
+        <span>{formatSliderDate(maxDate)}</span>
+      </div>
+    </div>
+  )
+}
+
+// Timeline component for popup
+function BusinessTimeline({ business }) {
+  const isActive = business.status === 'ACTIVE' || !business.permit_end
+  
+  return (
+    <div style={{
+      position: 'relative',
+      padding: '10px 0',
+      borderLeft: '3px solid #007bff',
+      marginBottom: '10px'
+    }}>
+      <div style={{ paddingLeft: '15px', marginBottom: '5px' }}>
+        <div style={{ fontSize: '10px', color: '#999', fontWeight: 'bold' }}>
+          OPENED
+        </div>
+        <div style={{ fontWeight: 'bold', fontSize: '12px' }}>
+          {formatDate(business.permit_begin)}
+        </div>
+      </div>
+      
+      <div style={{
+        paddingLeft: '15px',
+        margin: '10px 0',
+        fontStyle: 'italic',
+        color: '#666',
+        fontSize: '11px'
+      }}>
+        {calculateDuration(business.permit_begin, business.permit_end)}
+      </div>
+      
+      {business.permit_end ? (
+        <div style={{ paddingLeft: '15px' }}>
+          <div style={{ fontSize: '10px', color: '#999', fontWeight: 'bold' }}>
+            CLOSED
+          </div>
+          <div style={{ fontWeight: 'bold', fontSize: '12px' }}>
+            {formatDate(business.permit_end)}
+          </div>
+        </div>
+      ) : (
+        <div style={{
+          paddingLeft: '15px',
+          color: 'green',
+          fontWeight: 'bold',
+          fontSize: '12px'
+        }}>
+          Still Operating
+        </div>
+      )}
+    </div>
+  )
+}
+
+// Multi-business popup component
+function MultiBusinessPopup({ address, businesses }) {
+  const activeCount = businesses.filter(b => 
+    b.status === 'ACTIVE' || !b.permit_end
+  ).length
+  
+  return (
+    <div style={{ minWidth: '300px', maxWidth: '400px' }}>
+      <h4 style={{ 
+        marginBottom: '8px', 
+        fontSize: '15px',
+        borderBottom: '2px solid #007bff',
+        paddingBottom: '5px'
+      }}>
+        {address}
+      </h4>
+      
+      <div style={{ 
+        fontSize: '12px', 
+        color: '#666', 
+        marginBottom: '15px',
+        display: 'flex',
+        justifyContent: 'space-between'
+      }}>
+        <span>
+          {businesses.length} business{businesses.length !== 1 ? 'es' : ''} total
+        </span>
+        <span style={{ color: 'green', fontWeight: 'bold' }}>
+          {activeCount} active
+        </span>
+      </div>
+      
+      <div style={{ 
+        maxHeight: '400px', 
+        overflowY: 'auto',
+        marginTop: '10px'
+      }}>
+        {businesses.map((biz, i) => {
+          const isActive = biz.status === 'ACTIVE' || !biz.permit_end
+          
+          return (
+            <div key={i} style={{
+              padding: '12px',
+              marginBottom: '10px',
+              backgroundColor: isActive ? '#f0f8ff' : '#f8f8f8',
+              borderRadius: '6px',
+              borderLeft: `4px solid ${isActive ? '#28a745' : '#dc3545'}`
+            }}>
+              <div style={{ 
+                fontWeight: 'bold', 
+                fontSize: '13px',
+                marginBottom: '8px',
+                color: '#333'
+              }}>
+                {biz.name}
+              </div>
+              
+              <div style={{
+                display: 'inline-block',
+                padding: '3px 8px',
+                borderRadius: '4px',
+                fontSize: '10px',
+                fontWeight: 'bold',
+                marginBottom: '8px',
+                backgroundColor: isActive ? '#d4edda' : '#f8d7da',
+                color: isActive ? '#155724' : '#721c24'
+              }}>
+                {isActive ? 'ACTIVE' : 'INACTIVE'}
+              </div>
+              
+              <BusinessTimeline business={biz} />
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
 }
 
 function App() {
@@ -31,11 +296,16 @@ function App() {
   const [loading, setLoading] = useState(false)
   const [geocoding, setGeocoding] = useState(false)
   const [geocodeProgress, setGeocodeProgress] = useState(null)
-  const [activeOnly, setActiveOnly] = useState(true)
   const [mapCenter, setMapCenter] = useState([31.5, -99.5])
   const [mapZoom, setMapZoom] = useState(6)
   const [error, setError] = useState(null)
   const [ws, setWs] = useState(null)
+  
+  // Timeline state
+  const [timelineEnabled, setTimelineEnabled] = useState(false)
+  const [minDate, setMinDate] = useState(null)
+  const [maxDate, setMaxDate] = useState(null)
+  const [currentDate, setCurrentDate] = useState(null)
 
   // WebSocket connection
   useEffect(() => {
@@ -47,7 +317,6 @@ function App() {
     
     websocket.onmessage = (event) => {
       const data = JSON.parse(event.data)
-      console.log('WebSocket message:', data)
       
       if (data.type === 'geocode_start') {
         setGeocoding(true)
@@ -68,7 +337,6 @@ function App() {
           percent: data.percent
         })
         
-        // Refresh map data
         if (data.zipcode === zipcode) {
           loadBusinesses(data.zipcode)
         }
@@ -76,7 +344,6 @@ function App() {
         setGeocoding(false)
         setGeocodeProgress(null)
         
-        // Final refresh
         if (data.zipcode === zipcode) {
           loadBusinesses(data.zipcode)
         }
@@ -126,10 +393,17 @@ function App() {
 
   const loadBusinesses = async (zip) => {
     try {
-      const res = await axios.get(`${API_URL}/businesses/${zip}?active_only=${activeOnly}`)
-      setBusinesses(res.data)
+      const res = await axios.get(`${API_URL}/businesses/${zip}/timeline`)
+      setBusinesses(res.data.businesses)
       
-      const firstGeocoded = res.data.find(b => b.lat && b.lon)
+      // Set timeline range
+      if (res.data.min_date && res.data.max_date) {
+        setMinDate(res.data.min_date)
+        setMaxDate(res.data.max_date)
+        setCurrentDate(res.data.max_date) // Start at present
+      }
+      
+      const firstGeocoded = res.data.businesses.find(b => b.lat && b.lon)
       if (firstGeocoded) {
         setMapCenter([firstGeocoded.lat, firstGeocoded.lon])
         setMapZoom(13)
@@ -183,6 +457,30 @@ function App() {
     }
   }
 
+  // Filter businesses by timeline date
+  const filteredBusinesses = timelineEnabled && currentDate
+    ? businesses.filter(b => {
+        const begin = b.begin_timestamp
+        const end = b.end_timestamp
+        return begin && begin <= currentDate && currentDate <= end
+      })
+    : businesses
+
+  // Group businesses by address
+  const businessesByAddress = filteredBusinesses.reduce((acc, biz) => {
+    const key = `${biz.lat},${biz.lon}`
+    if (!acc[key]) {
+      acc[key] = {
+        address: biz.address,
+        lat: biz.lat,
+        lon: biz.lon,
+        businesses: []
+      }
+    }
+    acc[key].businesses.push(biz)
+    return acc
+  }, {})
+
   return (
     <div style={{ display: 'flex', height: '100vh' }}>
       {/* Sidebar */}
@@ -223,11 +521,11 @@ function App() {
           }}>
             <input
               type="checkbox"
-              checked={activeOnly}
-              onChange={(e) => setActiveOnly(e.target.checked)}
+              checked={timelineEnabled}
+              onChange={(e) => setTimelineEnabled(e.target.checked)}
               style={{ marginRight: '8px' }}
             />
-            <span style={{ fontSize: '14px' }}>Active businesses only</span>
+            <span style={{ fontSize: '14px' }}>Enable Timeline Filter</span>
           </label>
 
           <button
@@ -331,7 +629,12 @@ function App() {
             <div>ZIP Codes: {stats.zipcodes_cached || 0}</div>
             <div>Scrape Cache: {stats.scrape_cache_files || 0} files</div>
             <div>Geocode Cache: {stats.geocode_cache_files || 0} files</div>
-            <div>Showing: {businesses.length} businesses</div>
+            <div>Showing: {Object.keys(businessesByAddress).length} locations</div>
+            {timelineEnabled && (
+              <div style={{ color: '#007bff', fontWeight: 'bold' }}>
+                Filtered: {filteredBusinesses.length} businesses
+              </div>
+            )}
           </div>
         </div>
 
@@ -407,6 +710,17 @@ function App() {
           </div>
         )}
 
+        {/* Timeline Slider */}
+        {timelineEnabled && minDate && maxDate && (
+          <TimelineSlider
+            minDate={minDate}
+            maxDate={maxDate}
+            currentDate={currentDate}
+            onDateChange={setCurrentDate}
+            businesses={businesses}
+          />
+        )}
+
         <MapContainer
           center={mapCenter}
           zoom={mapZoom}
@@ -418,31 +732,18 @@ function App() {
             url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
           />
 
-          {businesses
-            .filter(b => b.lat && b.lon)
-            .map((business, idx) => (
+          {Object.entries(businessesByAddress)
+            .filter(([_, data]) => data.lat && data.lon)
+            .map(([coords, data]) => (
               <Marker
-                key={`${business.name}-${idx}`}
-                position={[business.lat, business.lon]}
+                key={coords}
+                position={[data.lat, data.lon]}
               >
-                <Popup maxWidth={300}>
-                  <div style={{ minWidth: '200px' }}>
-                    <h4 style={{ marginBottom: '8px', fontSize: '14px' }}>
-                      {business.name}
-                    </h4>
-                    <div style={{ fontSize: '12px', lineHeight: '1.6' }}>
-                      <div><strong>Address:</strong> {business.address}</div>
-                      <div>
-                        <strong>Status:</strong>{' '}
-                        <span style={{
-                          color: business.status === 'ACTIVE' ? 'green' : 'red',
-                          fontWeight: 'bold'
-                        }}>
-                          {business.status}
-                        </span>
-                      </div>
-                    </div>
-                  </div>
+                <Popup maxWidth={450} maxHeight={500}>
+                  <MultiBusinessPopup 
+                    address={data.address}
+                    businesses={data.businesses}
+                  />
                 </Popup>
               </Marker>
             ))}
